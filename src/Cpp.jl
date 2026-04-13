@@ -2,6 +2,35 @@ module Cpp
 
 export @cpp
 
+using Libdl
+
+# Runtime wrapper: perform dlsym at runtime, then delegate to a generated helper
+function call_cpp(::Type{R}, ::Type{ArgTuple}, mangled::AbstractString, lib, args...) where {R, ArgTuple}
+    libhandle = lib
+    if isa(lib, AbstractString)
+        libhandle = Libdl.dlopen(lib)
+    end
+    ptr = Libdl.dlsym(libhandle, mangled)
+    return _cpp_call_impl(R, ArgTuple, ptr, args...)
+end
+
+@generated function _cpp_call_impl(::Type{R}, ::Type{ArgTuple}, ptr, args...) where {R, ArgTuple}
+    # ArgTuple is a Tuple type like Tuple{T1,T2,...}
+    tuple_expr = Expr(:tuple, ArgTuple.parameters...)
+    # Build AST: ccall(ptr, R, (T1,T2,...), args[1], args[2], ...)
+    rettype_node = QuoteNode(R)
+    nargs = length(ArgTuple.parameters)
+    arg_exprs = Expr[]
+    for i = 1:nargs
+        push!(arg_exprs, Expr(:ref, :args, i))
+    end
+    return Expr(:call, :ccall, :ptr, rettype_node, tuple_expr, arg_exprs...)
+end
+
+# Note: we intentionally avoid a generated helper and instead expand the macro
+# into a direct `Base.Libdl.dlsym(...)` + `ccall(...)` expression so that
+# argument types are embedded as tuple literals and literal values are
+# preserved. This keeps the expansion simple and avoids hygiene surprises.
 # Useful references:
 # http://www.agner.org/optimize/calling_conventions.pdf
 # http://mentorembedded.github.io/cxx-abi/abi.html#mangling
@@ -18,19 +47,43 @@ macro cpp(ex)
     # (e.g., global consts), you do not need to use this macro (it
     # will work with a plain ccall, even though it is a C++ library)
     msg = "@cpp requires a ccall((:mysymbol, mylib),...)  expression"
+    if isa(ex,Expr) && ex.head == :call
+        if ex.args[1] != :ccall
+            error(msg)
+        end
+
+        # println("head: ", ex.head, " , args: ", ex.args)
+
+        ex = Expr(:ccall, ex.args[2:end]...)
+        
+        # println("ex: ", ex)
+        # println("isa: ", isa(ex,Expr))
+        # println("ex.head: ", ex.head)
+    end
+    
     if !isa(ex,Expr) || ex.head != :ccall
         error(msg)
     end
 
-    # Parse the library symbol's name
+    # Parse the library symbol's name and normalize the tuple
     exlib = ex.args[1]
-    if !(isa(exlib,Expr) && exlib.head == :tuple)
+    if !(isa(exlib,Expr) && exlib.head == :tuple && length(exlib.args) >= 2)
         error(msg)
     end
-    sym = exlib.args[1]
-    fstr = string(eval(sym))
-    #GNU3-4 ABI
-    fstr = string("_Z",length(fstr),fstr)
+    # extract symbol node and library node
+    symnode = exlib.args[1]
+    libnode = exlib.args[2]
+    # resolve the symbol name without unnecessary eval when possible
+    if isa(symnode,Expr) && symnode.head == :quote
+        symval = symnode.args[1]
+    elseif isa(symnode,Symbol)
+        symval = symnode
+    else
+        symval = eval(symnode)
+    end
+    fstr = string(symval)
+    # GNU3-4 ABI
+    fstr = string("_Z", length(fstr), fstr)
 
     # Parse the arguments to ccall and construct the parameter type string
     exargtypes = ex.args[3]
@@ -39,10 +92,10 @@ macro cpp(ex)
     end
     exargs = exargtypes.args
     pstr = ""
-    symtable = (:Void,:Bool,:Cchar,:Char,:ASCIIString,:Int,:Int8,:Uint8,:Int16,:Uint16,:Int32,:Cint,:Uint32,:Int64,:Uint64,:Float32,:Float64)
+    symtable = (:Void,:Bool,:Cchar,:Char,:String,:Int,:Int8,:Uint8,:Int16,:Uint16,:Int32,:Cint,:Uint32,:Int64,:Uint64,:Float32,:Float64)
     # GNU3-4 ABI v.3 and v.4
     ptable =   ('v',  'b',  'c',   'w',  "Pc",        'i', 'a',  'h',   's',   't',    'i',   'i',  'j',    'l',   'm',    'f',     'd')
-    msub = ASCIIString[]
+    msub = String[]
     for iarg = 1:length(exargs)
         thisarg = exargs[iarg]
         thisargm = ""
@@ -81,12 +134,20 @@ macro cpp(ex)
             error("@cpp: argument not recognized")
         end
     end
-    ex.args[1].args[1] = Expr(:quote, symbol(string(fstr,pstr)))
-    ex.args[1].args[2] = esc(ex.args[1].args[2])
+    # Build an expression that calls the runtime wrapper `call_cpp` with type literals
+    mangled = string(fstr, pstr)
+    rettype_node = esc(ex.args[2])
+    # pass the argument-type tuple type (e.g., Tuple{Float64}) as a Type literal
+    argtuple_type = Expr(:curly, :Tuple, ex.args[3].args...)
+    # library: escape if it's an expression/symbol, otherwise embed literal
+    lib_node = (isa(libnode,Expr) || isa(libnode,Symbol)) ? esc(libnode) : QuoteNode(libnode)
+
+    call_args = Any[rettype_node, argtuple_type, QuoteNode(mangled), lib_node]
     for ival = 4:length(ex.args)
-        ex.args[ival] = esc(ex.args[ival])
+        a = ex.args[ival]
+        push!(call_args, (isa(a,Expr) || isa(a,Symbol)) ? esc(a) : a)
     end
-    ex
+    return Expr(:call, :call_cpp, call_args...)
 end
 
-end
+end # module Cpp
