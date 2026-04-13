@@ -4,7 +4,6 @@ export @cpp
 
 using Libdl
 
-# Runtime wrapper: perform dlsym at runtime, then delegate to a generated helper
 function call_cpp(::Type{R}, ::Type{ArgTuple}, mangled::AbstractString, lib, args...) where {R, ArgTuple}
     libhandle = lib
     if isa(lib, AbstractString)
@@ -15,9 +14,7 @@ function call_cpp(::Type{R}, ::Type{ArgTuple}, mangled::AbstractString, lib, arg
 end
 
 @generated function _cpp_call_impl(::Type{R}, ::Type{ArgTuple}, ptr, args...) where {R, ArgTuple}
-    # ArgTuple is a Tuple type like Tuple{T1,T2,...}
     tuple_expr = Expr(:tuple, ArgTuple.parameters...)
-    # Build AST: ccall(ptr, R, (T1,T2,...), args[1], args[2], ...)
     rettype_node = QuoteNode(R)
     nargs = length(ArgTuple.parameters)
     arg_exprs = Expr[]
@@ -26,14 +23,6 @@ end
     end
     return Expr(:call, :ccall, :ptr, rettype_node, tuple_expr, arg_exprs...)
 end
-
-# Note: we intentionally avoid a generated helper and instead expand the macro
-# into a direct `Base.Libdl.dlsym(...)` + `ccall(...)` expression so that
-# argument types are embedded as tuple literals and literal values are
-# preserved. This keeps the expansion simple and avoids hygiene surprises.
-# Useful references:
-# http://www.agner.org/optimize/calling_conventions.pdf
-# http://mentorembedded.github.io/cxx-abi/abi.html#mangling
 
 const SUBSTITUTION = [""; map(string, collect(0:9)); map(string, collect('A':'Z'))]  # FIXME more than 37 arguments?
 
@@ -134,12 +123,9 @@ macro cpp(ex)
             error("@cpp: argument not recognized")
         end
     end
-    # Build an expression that calls the runtime wrapper `call_cpp` with type literals
     mangled = string(fstr, pstr)
     rettype_node = esc(ex.args[2])
-    # pass the argument-type tuple type (e.g., Tuple{Float64}) as a Type literal
     argtuple_type = Expr(:curly, :Tuple, ex.args[3].args...)
-    # library: escape if it's an expression/symbol, otherwise embed literal
     lib_node = (isa(libnode,Expr) || isa(libnode,Symbol)) ? esc(libnode) : QuoteNode(libnode)
 
     call_args = Any[rettype_node, argtuple_type, QuoteNode(mangled), lib_node]
